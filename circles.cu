@@ -108,12 +108,353 @@ void render_cpu(
 
 /// <--- your code here --->
 
+// PSeudo Code
+
 ////////////////////////////////////////////////////////////////////////////////
 // Optimized GPU Implementation
 
 namespace circles_gpu {
 
+#define THREADS_SCAN (4 * 32)
+#define CEIL_DIV(x, y) (((x) + (y) - 1) / (y))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define PAD 32
+#define SHMEM_PADDING(idx) ((idx) + ((idx) / PAD))
+
 /* TODO: your GPU kernels here... */
+
+__global__ void reduce_uint8(size_t n, uint8_t const *x, uint32_t *out) {
+
+    uint8_t const *x_block = x + blockIdx.x * blockDim.x;
+
+    extern __shared__ __align__(16) char shmem_raw[];
+    uint32_t *shmem = reinterpret_cast<uint32_t *>(shmem_raw);
+
+    shmem[SHMEM_PADDING(threadIdx.x)] =
+        *reinterpret_cast<const uint32_t *>(&x_block[threadIdx.x]);
+
+    __syncthreads();
+
+    for (int i = 1; i < THREADS_SCAN; i <<= 1) {
+        uint32_t add = (threadIdx.x >= i) ? shmem[SHMEM_PADDING(threadIdx.x - i)] : 0;
+        __syncthreads();
+        shmem[SHMEM_PADDING(threadIdx.x)] = add + shmem[SHMEM_PADDING(threadIdx.x)];
+        __syncthreads();
+    }
+
+    int last = MIN((int)n - (int)(blockIdx.x * blockDim.x), (int)blockDim.x) - 1;
+    out[blockIdx.x] = shmem[SHMEM_PADDING(last)];
+}
+
+__global__ void reduce(size_t n, uint32_t const *x, uint32_t *out) {
+
+    uint32_t const *x_block = x + blockIdx.x * blockDim.x;
+
+    extern __shared__ __align__(16) char shmem_raw[];
+    uint32_t *shmem = reinterpret_cast<uint32_t *>(shmem_raw);
+
+    shmem[SHMEM_PADDING(threadIdx.x)] = x_block[threadIdx.x];
+
+    __syncthreads();
+
+    for (int i = 1; i < THREADS_SCAN; i <<= 1) {
+        uint32_t add = (threadIdx.x >= i) ? shmem[SHMEM_PADDING(threadIdx.x - i)] : 0;
+        __syncthreads();
+        shmem[SHMEM_PADDING(threadIdx.x)] = add + shmem[SHMEM_PADDING(threadIdx.x)];
+        __syncthreads();
+    }
+
+    int last = MIN((int)n - (int)(blockIdx.x * blockDim.x), (int)blockDim.x) - 1;
+    out[blockIdx.x] = shmem[SHMEM_PADDING(last)];
+}
+
+__global__ void scan_block(size_t n, uint32_t const *x, uint32_t *out) {
+    uint32_t accumulator = 0;
+
+    extern __shared__ __align__(16) char shmem_raw[];
+    uint32_t *shmem = reinterpret_cast<uint32_t *>(shmem_raw);
+
+    shmem[SHMEM_PADDING(threadIdx.x)] = x[threadIdx.x];
+
+    __syncthreads();
+
+    for (int i = 1; i < THREADS_SCAN; i <<= 1) {
+        uint32_t add = (threadIdx.x >= i) ? shmem[SHMEM_PADDING(threadIdx.x - i)] : 0;
+        __syncthreads();
+        shmem[SHMEM_PADDING(threadIdx.x)] = add + shmem[SHMEM_PADDING(threadIdx.x)];
+        __syncthreads();
+    }
+    if (threadIdx.x < n)
+        out[threadIdx.x] = shmem[SHMEM_PADDING(threadIdx.x)];
+}
+
+__global__ void
+scan(size_t n, uint32_t const *x, uint32_t const *end_points, uint32_t *out) {
+
+    extern __shared__ __align__(16) char shmem_raw[];
+    uint32_t *shmem = reinterpret_cast<uint32_t *>(shmem_raw);
+
+    uint32_t const *x_block = x + blockIdx.x * blockDim.x;
+    uint32_t *out_block = out + blockIdx.x * blockDim.x;
+
+    shmem[SHMEM_PADDING(threadIdx.x)] = x_block[threadIdx.x];
+
+    __syncthreads();
+
+    for (int i = 1; i < THREADS_SCAN; i <<= 1) {
+        uint32_t add = (threadIdx.x >= i) ? shmem[SHMEM_PADDING(threadIdx.x - i)] : 0;
+        __syncthreads();
+        shmem[SHMEM_PADDING(threadIdx.x)] = add + shmem[SHMEM_PADDING(threadIdx.x)];
+        __syncthreads();
+    }
+    uint32_t block_carry = (blockIdx.x == 0) ? 0 : end_points[blockIdx.x - 1];
+    out_block[threadIdx.x] = block_carry + shmem[SHMEM_PADDING(threadIdx.x)];
+}
+
+// Returns desired size of scratch buffer in bytes.
+size_t get_workspace_size_scan(size_t n) {
+    /* TODO: your CPU code here... */
+    size_t total = n;
+    size_t size = n;
+    while (size > THREADS_SCAN) {
+        total += size;
+        size = CEIL_DIV(size, THREADS_SCAN);
+    }
+
+    return 2 * total * sizeof(uint32_t);
+}
+
+__global__ void fill_data(uint8_t *data_uint8, uint32_t *data) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    data[idx] = *reinterpret_cast<uint32_t *>(&data_uint8[idx]);
+}
+
+// 'launch_scan'
+//
+
+uint32_t *launch_scan(
+    size_t n,
+    uint8_t *x,     // pointer to GPU memory
+    void *workspace // pointer to GPU memory
+) {
+    /* TODO: your CPU code here... */
+    uint32_t *arr = reinterpret_cast<uint32_t *>(workspace); // size n
+    uint8_t *data_uint8 = x;
+    uint32_t *data;
+    uint32_t *orig_x;
+    // compute sums per block
+
+    size_t size = n;
+    size_t offsets[8];
+    offsets[0] = 0;
+    int iter = 1;
+
+    // first iteration with uint8
+    if (size > THREADS_SCAN) {
+        size_t blocks = CEIL_DIV(size, THREADS_SCAN);
+        reduce_uint8<<<blocks, THREADS_SCAN, (THREADS_SCAN + PAD) * sizeof(uint32_t)>>>(
+            size,
+            data_uint8,
+            arr + offsets[iter - 1]);
+
+        size = blocks;
+        data = arr + offsets[iter - 1];
+        offsets[iter] = offsets[iter - 1] + size;
+        iter++;
+    } else if (threadIdx.x < n) {
+        fill_data<<<CEIL_DIV(size, THREADS_SCAN), THREADS_SCAN>>>(data_uint8, orig_x);
+        data = orig_x;
+    }
+
+    while (size > THREADS_SCAN) {
+        size_t blocks = CEIL_DIV(size, THREADS_SCAN);
+        reduce<<<blocks, THREADS_SCAN, (THREADS_SCAN + PAD) * sizeof(uint32_t)>>>(
+            size,
+            data,
+            arr + offsets[iter - 1]);
+
+        size = blocks;
+        data = arr + offsets[iter - 1];
+
+        offsets[iter] = offsets[iter - 1] + size;
+        iter++;
+    }
+    iter--;
+
+    uint32_t *final_block = (iter == 0) ? orig_x : arr + offsets[iter];
+    size_t threads = MIN(THREADS_SCAN, n);
+
+    uint32_t *base_out = (iter == 0) ? arr : final_block + threads;
+
+    scan_block<<<1, threads, (threads + PAD) * sizeof(uint32_t)>>>(
+        size,
+        final_block,
+        base_out);
+
+    size_t larger_size = threads;
+    base_out += larger_size;
+    uint32_t *end_points = arr + offsets[iter];
+    if (n > THREADS_SCAN) {
+        while (iter >= 0) {
+
+            larger_size = (iter == 0) ? n : (offsets[iter] - offsets[iter - 1]);
+            size_t blocks = CEIL_DIV(larger_size, THREADS_SCAN);
+
+            uint32_t *data_ptr = (iter == 0) ? orig_x : arr + offsets[iter - 1];
+            scan<<<blocks, THREADS_SCAN, (THREADS_SCAN + PAD) * sizeof(uint32_t)>>>(
+                larger_size,
+                data_ptr,
+                end_points,
+                base_out);
+
+            size = larger_size;
+            iter--;
+            end_points = base_out;
+
+            base_out += larger_size;
+        }
+    }
+    base_out -= larger_size;
+
+    return base_out;
+}
+
+#define THREADS_X 32
+#define THREADS_Y 32
+#define TILE_SIZE 32
+
+/* TODO: your GPU kernels here... */
+__global__ void initialize_background(
+    int32_t width,
+    int32_t height,
+    float *img_red,
+    float *img_green,
+    float *img_blue) {
+
+    int32_t pixel_row = blockIdx.y * blockDim.y + threadIdx.y;
+    int32_t pixel_col = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t pixel_idx = pixel_row * width + pixel_col;
+
+    if (pixel_idx < width * height) {
+        img_red[pixel_idx] = 1.0f;
+        img_green[pixel_idx] = 1.0f;
+        img_blue[pixel_idx] = 1.0f;
+    }
+}
+
+__global__ void tile_coverage(
+    int32_t width,
+    int32_t height,
+    int32_t n_circle,
+    float const *circle_x,
+    float const *circle_y,
+    float const *circle_radius,
+    uint8_t *circle_map) {
+
+    int32_t circle = blockIdx.x * blockDim.x + threadIdx.x;
+    // uint8_t *tile_circle_map =
+    //     circle_map + tile_num * n_circle; // TODO: update if 8 circles/byte
+
+    int tile_width = width / TILE_SIZE;
+    int tile_height = height / TILE_SIZE;
+
+    float x = circle_x[circle];
+    float y = circle_y[circle];
+    float rad = circle_radius[circle];
+
+    float left = x - rad;
+    float right = x + rad;
+    float top = y - rad;
+    float bot = y + rad;
+
+    // go through each corner of the bounding box
+    int tile_tl = -1;
+    int tile_bl = -1;
+    int tile_tr = -1;
+    int tile_br = -1;
+
+    if (left > 0 && top > 0) {
+        tile_tl = (left / TILE_SIZE) * tile_width + (top / TILE_SIZE);
+    }
+    if (left > 0 && bot < height - 1) {
+        tile_bl = (left / TILE_SIZE) * tile_width + (top / TILE_SIZE);
+    }
+    if (right < width - 1 && top > 0) {
+        tile_tr = (right / TILE_SIZE) * tile_width + (top / TILE_SIZE);
+    }
+    if (right < width - 1 && bot < height - 1) {
+        tile_br = (right / TILE_SIZE) * tile_width + (bot / TILE_SIZE);
+    }
+
+    (circle_map + tile_tl)[circle] = 1;
+    (circle_map + tile_bl)[circle] = 1;
+    (circle_map + tile_tr)[circle] = 1;
+    (circle_map + tile_br)[circle] = 1;
+}
+
+__global__ void compact_stream(uint32_t *scanned_idxs, uint32_t *compacted_idxs) {
+    int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx == 0) {
+        compacted_idxs[0] = scanned_idxs[0] != 0;
+    } else if (scanned_idxs[idx] != scanned_idxs[idx - 1]) {
+        compacted_idxs[idx] = scanned_idxs[idx];
+    }
+}
+
+__global__ void render_pixels(
+    uint32_t **tile_circle_idxs,
+    uint32_t *num_circles_per_tile,
+    int32_t width,
+    int32_t height,
+    int32_t n_circle,
+    float const *circle_x,
+    float const *circle_y,
+    float const *circle_radius,
+    float const *circle_red,
+    float const *circle_green,
+    float const *circle_blue,
+    float const *circle_alpha,
+    float *img_red,
+    float *img_green,
+    float *img_blue) {
+
+    int32_t tile_idx = blockIdx.y * TILE_SIZE + blockIdx.x;
+    int32_t pixel_row = blockIdx.y * blockDim.y + threadIdx.y;
+    int32_t pixel_col = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t pixel_idx = pixel_row * width + pixel_col;
+
+    uint32_t *tile_circles = tile_circle_idxs[tile_idx];
+    uint32_t n_t_circles = num_circles_per_tile[tile_idx];
+
+    for (int i = 0; i < n_t_circles; ++i) {
+        uint32_t c_idx = tile_circles[i];
+
+        float x = circle_x[c_idx];
+        float y = circle_y[c_idx];
+        float rad = circle_radius[c_idx];
+
+        float dy = pixel_row - y;
+        float dx = pixel_col - x;
+
+        if (dy * dy + dx * dx < rad * rad) {
+
+            float red = img_red[pixel_idx];
+            float green = img_green[pixel_idx];
+            float blue = img_blue[pixel_idx];
+
+            float alpha = circle_alpha[i];
+
+            red = circle_red[i] * alpha + red * (1.0f - alpha);
+            green = circle_green[i] * alpha + green * (1.0f - alpha);
+            blue = circle_blue[i] * alpha + blue * (1.0f - alpha);
+
+            img_red[pixel_idx] = red;
+            img_green[pixel_idx] = green;
+            img_blue[pixel_idx] = blue;
+        }
+    }
+}
 
 void launch_render(
     int32_t width,
@@ -130,7 +471,72 @@ void launch_render(
     float *img_green,           // pointer to GPU memory
     float *img_blue,            // pointer to GPU memory
     GpuMemoryPool &memory_pool) {
-    /* TODO: your CPU code here... */
+
+    // Initialize background to white
+    dim3 threads_p = dim3(THREADS_X, THREADS_Y);
+    dim3 blocks_p = dim3(CEIL_DIV(width, THREADS_X), CEIL_DIV(height, THREADS_Y));
+
+    uint32_t threads_c = THREADS_X * THREADS_Y;
+    uint32_t blocks_c = CEIL_DIV(n_circle, threads_c);
+
+    initialize_background<<<blocks_p, threads_p>>>(
+        width,
+        height,
+        img_red,
+        img_green,
+        img_blue);
+
+    // Get circle coverage
+    int32_t num_tiles = (width / TILE_SIZE) * (height / TILE_SIZE);
+    size_t circle_map_size = num_tiles * n_circle *
+        sizeof(uint8_t); // TODO: update because can store 8 flags in a char
+    uint8_t *circle_map = reinterpret_cast<uint8_t *>(memory_pool.alloc(circle_map_size));
+
+    // dim3 threads = dim3(TILE_SIZE, TILE_SIZE);
+    // dim3 blocks = dim3(CEIL_DIV(width, TILE_SIZE), CEIL_DIV(height, TILE_SIZE));
+    tile_coverage<<<blocks_c, threads_c>>>(
+        width,
+        height,
+        n_circle,
+        circle_x,
+        circle_y,
+        circle_radius,
+        circle_map);
+
+    size_t scan_size = get_workspace_size_scan(n_circle);
+
+    uint32_t *tile_circle_idxs[num_tiles];
+    uint32_t *num_circles_per_tile;
+    for (int i = 0; i < num_tiles; ++i) {
+        void *scan_workspace = memory_pool.alloc(scan_size);
+        uint32_t *scanned_circle_idxs =
+            launch_scan(n_circle, circle_map + i * n_circle, scan_workspace);
+
+        num_circles_per_tile[i] = scanned_circle_idxs[n_circle - 1];
+        uint32_t *compacted_stream = reinterpret_cast<uint32_t *>(
+            memory_pool.alloc(num_circles_per_tile[i] * sizeof(uint32_t)));
+
+        compact_stream<<<blocks_c, threads_c>>>(scanned_circle_idxs, compacted_stream);
+        tile_circle_idxs[i] = compacted_stream;
+    }
+
+    // parallelize over pixels
+    render_pixels<<<blocks_p, threads_p>>>(
+        tile_circle_idxs,
+        num_circles_per_tile,
+        width,
+        height,
+        n_circle,
+        circle_x,
+        circle_y,
+        circle_radius,
+        circle_red,
+        circle_green,
+        circle_blue,
+        circle_alpha,
+        img_red,
+        img_green,
+        img_blue);
 }
 
 } // namespace circles_gpu
@@ -700,7 +1106,9 @@ int main(int argc, char const *const *argv) {
     scenes.push_back(
         {"overlapping_transparent", Mode::TEST, gen_overlapping_transparent()});
     scenes.push_back(
-        {"ten_million_circles", Mode::BENCHMARK, gen_random(rng, 1024, 1024, 10'000'000)});
+        {"ten_million_circles",
+         Mode::BENCHMARK,
+         gen_random(rng, 1024, 1024, 10'000'000)});
 
     int32_t fail_count = 0;
 
