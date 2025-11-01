@@ -410,12 +410,8 @@ __global__ void tile_coverage(
 __global__ void compact_stream(
     uint32_t n_circle,
     uint32_t *scanned_idxs,
-    uint32_t *compacted_idxs
-    // uint32_t **ptr_array
-    // const float *circle_x,
-    // float *x_coal,
-    // float **x_coal_ptr
-) {
+    uint32_t *compacted_idxs,
+    uint32_t *num_circles_per_tile) {
 
     int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -426,22 +422,20 @@ __global__ void compact_stream(
             uint32_t c_idx = scanned_idxs[idx];
 
             compacted_idxs[c_idx - 1] = idx;
-            // x_coal[c_idx - 1] = circle_x[idx];
         }
     }
-    // if (threadIdx.x == 0 && blockIdx.x == 0) {
-    //     *ptr_array = compacted_idxs;
-    // }
-    // *x_coal_ptr = x_coal;
+    if (idx == n_circle - 1) {
+        *num_circles_per_tile = scanned_idxs[idx];
+    }
 }
 
 #define CIRCLE_STATS 8
 __global__ void render_pixels(
     uint32_t *num_circles_per_tile,
+    uint32_t n_circle,
     uint32_t num_tiles,
     int32_t width,
     int32_t height,
-    int32_t n_circle,
     float const *circle_x,
     float const *circle_y,
     float const *circle_radius,
@@ -469,19 +463,8 @@ __global__ void render_pixels(
     float *shmem = reinterpret_cast<float *>(shmem_raw);
     const int threads = blockDim.x * blockDim.y;
 
-    // float *x_sh = shmem + threads + 7;
-    // float *y_sh = x_sh + threads + 7;
-    // float *radius_sh = y_sh + threads + 7;
-    // float *alpha_sh = radius_sh + threads + 7;
-    // float *red_sh = alpha_sh + threads + 7;
-    // float *green_sh = red_sh + threads + 7;
-    // float *blue_sh = green_sh + threads + 7;
-
     uint32_t n_t_circles = num_circles_per_tile[tile_idx];
-
-    // printf("n t  circles: %d\n", n_t_circles);
     uint32_t *tile_circles = compacted_stream + tile_idx * MAX_CIRCLES_PER_TILE;
-    // float *x_coal = x_coal_ptr[tile_idx];
 
     float red_out[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     float green_out[4] = {1.0f, 1.0f, 1.0f, 1.0f};
@@ -507,16 +490,9 @@ __global__ void render_pixels(
                 circle_blue[c_idx],
                 0.0f // padding (unused)
             );
+
             reinterpret_cast<float4 *>(&shmem[CIRCLE_STATS * tid])[0] = circle_xyra;
             reinterpret_cast<float4 *>(&shmem[CIRCLE_STATS * tid])[1] = circle_rgbp;
-
-            // x_sh[tid] = circle_x[c_idx];
-            // y_sh[tid] = circle_y[c_idx];
-            // radius_sh[tid] = circle_radius[c_idx];
-            // alpha_sh[tid] = circle_alpha[c_idx];
-            // red_sh[tid] = circle_red[c_idx];
-            // green_sh[tid] = circle_green[c_idx];
-            // blue_sh[tid] = circle_blue[c_idx];
         }
 
         int loop_iters = threads;
@@ -549,14 +525,6 @@ __global__ void render_pixels(
                     float c_green = rgbp.y;
                     float c_blue = rgbp.z;
 
-                    // float x = x_sh[i];
-                    // float y = y_sh[i];
-                    // float rad = radius_sh[i];
-                    // float alpha = alpha_sh[i];
-                    // float c_red = red_sh[i];
-                    // float c_green = green_sh[i];
-                    // float c_blue = blue_sh[i];
-
                     float dy = pixel_row - y;
                     float dx = pixel_col - x;
 
@@ -566,7 +534,6 @@ __global__ void render_pixels(
                     red_out[b_id] = c_red * alpha + red_out[b_id] * (1.0f - alpha);
                     green_out[b_id] = c_green * alpha + green_out[b_id] * (1.0f - alpha);
                     blue_out[b_id] = c_blue * alpha + blue_out[b_id] * (1.0f - alpha);
-                    // printf("PRINTING\n");
                 }
             }
         }
@@ -587,7 +554,7 @@ __global__ void render_pixels(
             img_blue[pixel_idx] = blue_out[b_id];
         }
     }
-}
+} // namespace circles_gpu
 
 void launch_render(
     int32_t width,
@@ -605,10 +572,6 @@ void launch_render(
     float *img_blue,            // pointer to GPU memory
     GpuMemoryPool &memory_pool) {
 
-    // printf("n_circle: %d. size size: %d\n", n_circle, sizeof(size_t));
-
-    // Initialize background to white
-
     uint32_t threads_c = THREADS_X * THREADS_Y;
     uint32_t blocks_c = CEIL_DIV(n_circle, threads_c);
 
@@ -616,7 +579,6 @@ void launch_render(
     int32_t num_tiles = CEIL_DIV(width, TILE_SIZE) * CEIL_DIV(height, TILE_SIZE);
     size_t circle_map_size = (size_t)num_tiles * (size_t)n_circle * sizeof(uint8_t);
 
-    // printf("cmap size: %lf\n", circle_map_size / (1000 * 1000 * 1000));
     uint8_t *circle_map = reinterpret_cast<uint8_t *>(memory_pool.alloc(circle_map_size));
 
     tile_coverage<<<blocks_c, threads_c>>>(
@@ -628,16 +590,12 @@ void launch_render(
         circle_radius,
         circle_map,
         num_tiles);
-    // return;
-    // printf("tile coverage success\n");
 
     size_t scan_size = get_workspace_size_scan(n_circle);
 
     uint32_t **tile_circle_idxs =
         reinterpret_cast<uint32_t **>(memory_pool.alloc(num_tiles * sizeof(uint32_t *)));
-    float **x_coal_ptr =
-        reinterpret_cast<float **>(memory_pool.alloc(num_tiles * sizeof(float *)));
-    //[num_tiles]; // pointers to GPU memory
+
     uint32_t *num_circles_per_tile = reinterpret_cast<uint32_t *>(
         memory_pool.alloc(num_tiles * sizeof(uint32_t))); //[num_tiles];
     void *scan_workspace = memory_pool.alloc(scan_size);
@@ -649,29 +607,18 @@ void launch_render(
 
     for (int i = 0; i < num_tiles; ++i) {
 
-        // REAL
-        // printf("scanning %d\n", i);
         uint32_t *scanned_circle_idxs = launch_scan(
             (size_t)n_circle,
             circle_map + (size_t)i * (size_t)n_circle,
             scan_workspace);
 
-        CUDA_CHECK(cudaMemcpy(
-            num_circles_per_tile + i,
-            scanned_circle_idxs + (n_circle - 1),
-            sizeof(uint32_t),
-            cudaMemcpyDeviceToDevice // this must match your pointers
-            ));
-
         compact_stream<<<blocks_c, threads_c>>>(
             n_circle,
             scanned_circle_idxs,
-            compacted_stream + i * MAX_CIRCLES_PER_TILE);
+            compacted_stream + i * MAX_CIRCLES_PER_TILE,
+            num_circles_per_tile + i);
     }
 
-    // printf("MAX TEMP: %zu\n", mtemp);
-
-    int tileToBlock = (TILE_SIZE / THREADS_X);
     dim3 threads_p = dim3(THREADS_X, THREADS_Y);
     dim3 blocks_p = dim3(CEIL_DIV(width, TILE_SIZE), CEIL_DIV(height, TILE_SIZE));
 
@@ -683,10 +630,10 @@ void launch_render(
 
     render_pixels<<<blocks_p, threads_p, render_shmem>>>(
         num_circles_per_tile,
+        n_circle,
         num_tiles,
         width,
         height,
-        n_circle,
         circle_x,
         circle_y,
         circle_radius,
@@ -697,11 +644,7 @@ void launch_render(
         img_red,
         img_green,
         img_blue,
-        compacted_stream
-
-        // x_coal_ptr
-
-    );
+        compacted_stream);
 }
 
 } // namespace circles_gpu
