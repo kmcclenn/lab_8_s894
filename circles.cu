@@ -165,9 +165,6 @@ __global__ void reduce(size_t n, uint32_t const *x, uint32_t *out) {
     if (offset < n) {
         shmem[SHMEM_PADDING(threadIdx.x)] = x[offset];
     }
-    //  else {
-    //     shmem[SHMEM_PADDING(threadIdx.x)] = 0;
-    // }
 
     __syncthreads();
 
@@ -433,7 +430,9 @@ __global__ void compact_stream(
             // x_coal[c_idx - 1] = circle_x[idx];
         }
     }
-    *ptr_array = compacted_idxs;
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        *ptr_array = compacted_idxs;
+    }
     // *x_coal_ptr = x_coal;
 }
 
@@ -471,6 +470,14 @@ __global__ void render_pixels(
     float *shmem = reinterpret_cast<float *>(shmem_raw);
     const int threads = blockDim.x * blockDim.y;
 
+    // float *x_sh = shmem + threads + 7;
+    // float *y_sh = x_sh + threads + 7;
+    // float *radius_sh = y_sh + threads + 7;
+    // float *alpha_sh = radius_sh + threads + 7;
+    // float *red_sh = alpha_sh + threads + 7;
+    // float *green_sh = red_sh + threads + 7;
+    // float *blue_sh = green_sh + threads + 7;
+
     uint32_t n_t_circles = num_circles_per_tile[tile_idx];
 
     // printf("n t  circles: %d\n", n_t_circles);
@@ -503,6 +510,14 @@ __global__ void render_pixels(
             );
             reinterpret_cast<float4 *>(&shmem[CIRCLE_STATS * tid])[0] = circle_xyra;
             reinterpret_cast<float4 *>(&shmem[CIRCLE_STATS * tid])[1] = circle_rgbp;
+
+            // x_sh[tid] = circle_x[c_idx];
+            // y_sh[tid] = circle_y[c_idx];
+            // radius_sh[tid] = circle_radius[c_idx];
+            // alpha_sh[tid] = circle_alpha[c_idx];
+            // red_sh[tid] = circle_red[c_idx];
+            // green_sh[tid] = circle_green[c_idx];
+            // blue_sh[tid] = circle_blue[c_idx];
         }
 
         int loop_iters = threads;
@@ -535,22 +550,30 @@ __global__ void render_pixels(
                     float c_green = rgbp.y;
                     float c_blue = rgbp.z;
 
+                    // float x = x_sh[i];
+                    // float y = y_sh[i];
+                    // float rad = radius_sh[i];
+                    // float alpha = alpha_sh[i];
+                    // float c_red = red_sh[i];
+                    // float c_green = green_sh[i];
+                    // float c_blue = blue_sh[i];
+
                     float dy = pixel_row - y;
                     float dx = pixel_col - x;
 
-                    if (dy * dy + dx * dx < rad * rad) {
+                    if (!(dy * dy + dx * dx < rad * rad))
+                        continue;
 
-                        red_out[b_id] = c_red * alpha + red_out[b_id] * (1.0f - alpha);
-                        green_out[b_id] =
-                            c_green * alpha + green_out[b_id] * (1.0f - alpha);
-                        blue_out[b_id] = c_blue * alpha + blue_out[b_id] * (1.0f - alpha);
-                        // printf("PRINTING\n");
-                    }
+                    red_out[b_id] = c_red * alpha + red_out[b_id] * (1.0f - alpha);
+                    green_out[b_id] = c_green * alpha + green_out[b_id] * (1.0f - alpha);
+                    blue_out[b_id] = c_blue * alpha + blue_out[b_id] * (1.0f - alpha);
+                    // printf("PRINTING\n");
                 }
             }
         }
         // __syncthreads();
     }
+
     for (int i = 0; i < blockToTile; ++i) {
         for (int j = 0; j < blockToTile; ++j) {
 
@@ -566,7 +589,7 @@ __global__ void render_pixels(
         }
     }
 }
-
+#define MAX_CIRCLES_PER_TILE 45000
 void launch_render(
     int32_t width,
     int32_t height,
@@ -620,6 +643,8 @@ void launch_render(
         memory_pool.alloc(num_tiles * sizeof(uint32_t))); //[num_tiles];
     void *scan_workspace = memory_pool.alloc(scan_size);
 
+    size_t mtemp = 0;
+
     for (int i = 0; i < num_tiles; ++i) {
 
         // REAL
@@ -664,24 +689,22 @@ void launch_render(
         uint32_t *compacted_stream =
             reinterpret_cast<uint32_t *>(memory_pool.alloc(temp * sizeof(uint32_t)));
 
+        if (temp > mtemp) {
+            mtemp = temp;
+        }
         // float *x_coal =
-        reinterpret_cast<float *>(memory_pool.alloc(temp * sizeof(float)));
+        // reinterpret_cast<float *>(memory_pool.alloc(temp * sizeof(float)));
 
         compact_stream<<<blocks_c, threads_c>>>(
             n_circle,
             temp,
             scanned_circle_idxs,
             compacted_stream,
-            (tile_circle_idxs + i)
-
-            // circle_x,
-            // x_coal,
-            // x_coal_ptr + i
-        );
+            (tile_circle_idxs + i));
     }
 
-    // dim3 threads_ti = dim3(TILE_SIZE, TILE_SIZE);
-    // dim3 blocks_ti = dim3(CEIL_DIV(width, TILE_SIZE), CEIL_DIV(height, TILE_SIZE));
+    printf("MAX TEMP: %zu\n", mtemp);
+
     int tileToBlock = (TILE_SIZE / THREADS_X);
     dim3 threads_p = dim3(THREADS_X, THREADS_Y);
     dim3 blocks_p = dim3(CEIL_DIV(width, TILE_SIZE), CEIL_DIV(height, TILE_SIZE));
