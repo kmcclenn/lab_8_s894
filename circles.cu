@@ -125,58 +125,109 @@ namespace circles_gpu {
 
 /* TODO: your GPU kernels here... */
 
-__global__ void reduce_uint8(size_t n, uint8_t const *x, uint32_t *out) {
+// __global__ void reduce_uint8(size_t n, uint8_t const *x, uint32_t *out) {
 
-    size_t base = (size_t)blockIdx.x * (size_t)blockDim.x;
-    size_t offset = base + (size_t)threadIdx.x;
+//     size_t base = (size_t)blockIdx.x * (size_t)blockDim.x;
+//     size_t offset = base + (size_t)threadIdx.x;
 
-    extern __shared__ __align__(16) char shmem_raw[];
-    uint32_t *shmem = reinterpret_cast<uint32_t *>(shmem_raw);
+//     extern __shared__ __align__(16) char shmem_raw[];
+//     uint32_t *shmem = reinterpret_cast<uint32_t *>(shmem_raw);
 
-    if (offset < n) {
+//     if (offset < n) {
 
-        shmem[SHMEM_PADDING(threadIdx.x)] = (uint32_t)(x[offset]);
+//         shmem[SHMEM_PADDING(threadIdx.x)] = (uint32_t)(x[offset]);
+//     }
+//     //  else {
+//     //     shmem[SHMEM_PADDING(threadIdx.x)] = 0;
+//     // }
+
+//     __syncthreads();
+
+//     for (int i = 1; i < THREADS_SCAN; i <<= 1) {
+//         uint32_t add = (threadIdx.x >= i) ? shmem[SHMEM_PADDING(threadIdx.x - i)] : 0;
+//         __syncthreads();
+//         shmem[SHMEM_PADDING(threadIdx.x)] = add + shmem[SHMEM_PADDING(threadIdx.x)];
+//         __syncthreads();
+//     }
+
+//     int last = MIN((int)n - (int)(blockIdx.x * blockDim.x), (int)blockDim.x) - 1;
+//     out[blockIdx.x] = shmem[SHMEM_PADDING(last)];
+// }
+__global__ void
+reduce_uint8(size_t n, const uint8_t *__restrict__ x, uint32_t *__restrict__ out) {
+    const unsigned FULL_MASK = 0xFFFFFFFFu;
+    const int WARP_SIZE = 32;
+
+    const size_t base = size_t(blockIdx.x) * blockDim.x;
+    const size_t idx = base + threadIdx.x;
+
+    // Load one byte, widen to u32; zero if tail thread is OOB
+    uint32_t v = (idx < n) ? (uint32_t)x[idx] : 0u;
+
+    // Intra-warp tree reduction using shfl_down
+    int lane = threadIdx.x & (WARP_SIZE - 1);
+    int warp = threadIdx.x >> 5; // 0..3 for 128 threads
+
+    for (int off = WARP_SIZE >> 1; off > 0; off >>= 1) {
+        v += __shfl_down_sync(FULL_MASK, v, off);
     }
-    //  else {
-    //     shmem[SHMEM_PADDING(threadIdx.x)] = 0;
-    // }
 
+    // Lane 0 of each warp writes its partial sum
+    __shared__ uint32_t warp_sums[4]; // 4 warps @ 128 threads
+    if (lane == 0)
+        warp_sums[warp] = v;
     __syncthreads();
 
-    for (int i = 1; i < THREADS_SCAN; i <<= 1) {
-        uint32_t add = (threadIdx.x >= i) ? shmem[SHMEM_PADDING(threadIdx.x - i)] : 0;
-        __syncthreads();
-        shmem[SHMEM_PADDING(threadIdx.x)] = add + shmem[SHMEM_PADDING(threadIdx.x)];
-        __syncthreads();
+    // Warp 0 reduces the 4 warp sums
+    if (warp == 0) {
+        uint32_t wv = (lane < 4) ? warp_sums[lane] : 0u;
+        // Only two steps needed for 4 lanes (safe to run standard loop too)
+        wv += __shfl_down_sync(FULL_MASK, wv, 2);
+        wv += __shfl_down_sync(FULL_MASK, wv, 1);
+        if (lane == 0)
+            out[blockIdx.x] = wv;
     }
-
-    int last = MIN((int)n - (int)(blockIdx.x * blockDim.x), (int)blockDim.x) - 1;
-    out[blockIdx.x] = shmem[SHMEM_PADDING(last)];
 }
 
-__global__ void reduce(size_t n, uint32_t const *x, uint32_t *out) {
+__global__ void
+reduce(size_t n, const uint32_t *__restrict__ x, uint32_t *__restrict__ out) {
+    const unsigned FULL_MASK = 0xFFFFFFFFu;
+    const int WARP_SIZE = 32;
 
-    // uint32_t const *x_block = x + blockIdx.x * blockDim.x;
-    size_t base = (size_t)blockIdx.x * (size_t)blockDim.x;
-    size_t offset = base + (size_t)threadIdx.x;
+    const size_t base = size_t(blockIdx.x) * blockDim.x;
+    const size_t idx = base + threadIdx.x;
 
-    extern __shared__ __align__(16) char shmem_raw[];
-    uint32_t *shmem = reinterpret_cast<uint32_t *>(shmem_raw);
-    if (offset < n) {
-        shmem[SHMEM_PADDING(threadIdx.x)] = x[offset];
+    // Load (zero for out-of-range tail threads)
+    uint32_t v = (idx < n) ? x[idx] : 0;
+
+    // Intra-warp reduction (inclusive → final value lands in lane 0)
+    int lane = threadIdx.x & (WARP_SIZE - 1);
+    int warp = threadIdx.x >> 5; // 0..3 for blockDim=128
+
+    // Tree reduction with shfl_down
+    for (int offset = WARP_SIZE >> 1; offset > 0; offset >>= 1) {
+        v += __shfl_down_sync(FULL_MASK, v, offset);
     }
 
+    // Each warp writes its sum to shared (lane 0 only)
+    __shared__ uint32_t warp_sums[4]; // 4 warps for 128 threads
+    if (lane == 0)
+        warp_sums[warp] = v;
     __syncthreads();
 
-    for (int i = 1; i < THREADS_SCAN; i <<= 1) {
-        uint32_t add = (threadIdx.x >= i) ? shmem[SHMEM_PADDING(threadIdx.x - i)] : 0;
-        __syncthreads();
-        shmem[SHMEM_PADDING(threadIdx.x)] = add + shmem[SHMEM_PADDING(threadIdx.x)];
-        __syncthreads();
-    }
+    // Warp 0 reduces the 4 warp sums using shuffles
+    if (warp == 0) {
+        // Lanes 0..3 hold the 4 partial sums; others use 0
+        uint32_t wv = (lane < 4) ? warp_sums[lane] : 0;
 
-    int last = MIN((int)n - (int)(blockIdx.x * blockDim.x), (int)blockDim.x) - 1;
-    out[blockIdx.x] = shmem[SHMEM_PADDING(last)];
+        // Reduce across these 4 lanes (2,1 steps are enough; extra steps add zeros
+        // safely)
+        wv += __shfl_down_sync(FULL_MASK, wv, 2);
+        wv += __shfl_down_sync(FULL_MASK, wv, 1);
+
+        if (lane == 0)
+            out[blockIdx.x] = wv;
+    }
 }
 
 __global__ void scan_block(size_t n, uint32_t const *x, uint32_t *out) {
@@ -248,6 +299,80 @@ scan(size_t n, uint32_t const *x, uint32_t const *end_points, uint32_t *out) {
     if (offset < n)
         out[offset] = block_carry + shmem[SHMEM_PADDING(threadIdx.x)];
 }
+// __global__ void scan(
+//     size_t n,
+//     const uint32_t *__restrict__ x,
+//     const uint32_t *__restrict__ end_points, // scanned block totals
+//     uint32_t *__restrict__ out) {
+//     const unsigned FULL_MASK = 0xFFFFFFFFu;
+//     const int WARP_SIZE = 32;
+
+//     const size_t base = size_t(blockIdx.x) * blockDim.x;
+//     const size_t idx = base + threadIdx.x;
+
+//     // Load element (0 for OOB lanes so scans stay correct on the tail block)
+//     uint32_t v = (idx < n) ? x[idx] : 0u;
+
+//     // Intra-warp inclusive scan
+//     const int lane = threadIdx.x & (WARP_SIZE - 1);
+//     const int warp = threadIdx.x >> 5; // 0..3 for 128 threads
+
+//     // Mask of active lanes in this warp (those with idx < n)
+//     unsigned active = __ballot_sync(FULL_MASK, idx < n);
+
+// #pragma unroll
+//     for (int d = 1; d < WARP_SIZE; d <<= 1) {
+//         uint32_t u = __shfl_up_sync(active, v, d);
+//         if (lane >= d)
+//             v += u;
+//     }
+
+//     // Write each warp's total to shared; for a partial warp, use its last active lane.
+//     __shared__ uint32_t warp_sums[32]; // enough for up to 1024 threads
+//     if (active) {
+//         // Find last active lane in this warp
+//         int last = 31 - __clz(active);
+//         if (lane == last)
+//             warp_sums[warp] = v;
+//     } else {
+//         // No active lanes in this warp (happens only on tail blocks beyond n)
+//         if (lane == 0)
+//             warp_sums[warp] = 0u;
+//     }
+//     __syncthreads();
+
+//     // Warp 0 scans the warp_sums to get per-warp offsets (inclusive)
+//     uint32_t warp_off = 0u;
+//     if (warp == 0) {
+//         const int WARPS = blockDim.x / WARP_SIZE; // 4 for 128
+//         uint32_t t = (lane < WARPS) ? warp_sums[lane] : 0u;
+
+// #pragma unroll
+//         for (int d = 1; d < WARP_SIZE; d <<= 1) {
+//             uint32_t u = __shfl_up_sync(FULL_MASK, t, d);
+//             if (lane >= d)
+//                 t += u;
+//         }
+//         warp_sums[lane] = t; // inclusive prefix of warp totals
+//     }
+//     __syncthreads();
+
+//     if (warp > 0) {
+//         // Exclusive offset from prior warps in this block
+//         warp_off = warp_sums[warp - 1];
+//     }
+
+//     // Add per-warp offset
+//     v += warp_off;
+
+//     // Add block carry from previous blocks (end_points is inclusive scan of block
+//     totals) uint32_t block_carry = (blockIdx.x == 0) ? 0u : end_points[blockIdx.x - 1];
+//     v += block_carry;
+
+//     // Store result if in range
+//     if (idx < n)
+//         out[idx] = v;
+// }
 
 // Returns desired size of scratch buffer in bytes.
 size_t get_workspace_size_scan(size_t n) {
@@ -271,92 +396,346 @@ __global__ void fill_data(uint8_t *data_uint8, uint32_t *data, uint32_t n) {
 // 'launch_scan'
 //
 
-uint32_t *launch_scan(
-    size_t n,
-    uint8_t *x,     // pointer to GPU memory
-    void *workspace // pointer to GPU memory
-    // uint32_t *orig_x // 32 bit representation
-) {
-    /* TODO: your CPU code here... */
-    uint32_t *arr = reinterpret_cast<uint32_t *>(workspace); // size n
-    uint8_t *data_uint8 = x;
-    uint32_t *data;
-    // uint32_t *orig_x;
-    // compute sums per block
+// uint32_t *launch_scan(
+//     size_t n,
+//     uint8_t *x,     // pointer to GPU memory
+//     void *workspace // pointer to GPU memory
+//     // uint32_t *orig_x // 32 bit representation
+// ) {
+//     /* TODO: your CPU code here... */
+//     uint32_t *arr = reinterpret_cast<uint32_t *>(workspace); // size n
+//     uint8_t *data_uint8 = x;
+//     uint32_t *data;
+//     // uint32_t *orig_x;
+//     // compute sums per block
 
-    size_t size = n;
-    size_t offsets[8];
-    offsets[0] = 0;
-    int iter = 1;
+//     size_t size = n;
+//     size_t offsets[8];
+//     offsets[0] = 0;
+//     int iter = 1;
 
-    // first iteration with uint8
-    fill_data<<<CEIL_DIV(size, THREADS_SCAN), THREADS_SCAN>>>(data_uint8, arr, size);
-    data = arr;
-    offsets[0] = size;
+//     // first iteration with uint8
+//     fill_data<<<CEIL_DIV(size, THREADS_SCAN), THREADS_SCAN>>>(data_uint8, arr, size);
+//     data = arr;
+//     offsets[0] = size;
 
-    if (size > THREADS_SCAN) {
-        size_t blocks = CEIL_DIV(size, THREADS_SCAN);
-        // printf("Reducing with %d blocks and %d threads\n", blocks, THREADS_SCAN);
-        reduce_uint8<<<blocks, THREADS_SCAN, (THREADS_SCAN + PAD) * sizeof(uint32_t)>>>(
-            size,
-            data_uint8,
-            arr + offsets[iter - 1]);
+//     if (size > THREADS_SCAN) {
+//         size_t blocks = CEIL_DIV(size, THREADS_SCAN);
+//         // printf("Reducing with %d blocks and %d threads\n", blocks, THREADS_SCAN);
+//         reduce_uint8<<<blocks, THREADS_SCAN, (THREADS_SCAN + PAD) *
+//         sizeof(uint32_t)>>>(
+//             size,
+//             data_uint8,
+//             arr + offsets[iter - 1]);
 
-        size = blocks;
-        data = arr + offsets[iter - 1];
-        offsets[1] = size + offsets[0];
-        iter++;
-    }
+//         size = blocks;
+//         data = arr + offsets[iter - 1];
+//         offsets[1] = size + offsets[0];
+//         iter++;
+//     }
 
-    while (size > THREADS_SCAN) {
-        size_t blocks = CEIL_DIV(size, THREADS_SCAN);
-        reduce<<<blocks, THREADS_SCAN, (THREADS_SCAN + PAD) * sizeof(uint32_t)>>>(
-            size,
-            data,
-            arr + offsets[iter - 1]);
+//     while (size > THREADS_SCAN) {
+//         size_t blocks = CEIL_DIV(size, THREADS_SCAN);
+//         reduce<<<blocks, THREADS_SCAN, (THREADS_SCAN + PAD) * sizeof(uint32_t)>>>(
+//             size,
+//             data,
+//             arr + offsets[iter - 1]);
 
-        size = blocks;
-        data = arr + offsets[iter - 1];
+//         size = blocks;
+//         data = arr + offsets[iter - 1];
 
-        offsets[iter] = offsets[iter - 1] + size;
-        iter++;
-    }
-    iter--;
+//         offsets[iter] = offsets[iter - 1] + size;
+//         iter++;
+//     }
+//     iter--;
 
-    uint32_t *final_block = (iter == 0) ? arr : arr + offsets[iter];
-    size_t threads = MIN(THREADS_SCAN, n);
+//     uint32_t *final_block = (iter == 0) ? arr : arr + offsets[iter];
+//     size_t threads = MIN(THREADS_SCAN, n);
 
-    uint32_t *base_out = (iter == 0) ? arr : final_block + threads;
+//     uint32_t *base_out = (iter == 0) ? arr : final_block + threads;
 
-    scan_block<<<1, threads, (32) * sizeof(uint32_t)>>>(size, final_block, base_out);
+//     scan_block<<<1, threads, (32) * sizeof(uint32_t)>>>(size, final_block, base_out);
 
-    size_t larger_size = threads;
-    base_out += larger_size;
-    uint32_t *end_points = arr + offsets[iter];
-    if (n > THREADS_SCAN) {
-        while (iter >= 0) {
+//     size_t larger_size = threads;
+//     base_out += larger_size;
+//     uint32_t *end_points = arr + offsets[iter];
+//     if (n > THREADS_SCAN) {
+//         while (iter >= 0) {
 
-            larger_size = (iter == 0) ? n : (offsets[iter] - offsets[iter - 1]);
-            size_t blocks = CEIL_DIV(larger_size, THREADS_SCAN);
+//             larger_size = (iter == 0) ? n : (offsets[iter] - offsets[iter - 1]);
+//             size_t blocks = CEIL_DIV(larger_size, THREADS_SCAN);
 
-            uint32_t *data_ptr =
-                (iter == 0) ? arr : arr + offsets[iter - 1]; // think this is buggy
-            scan<<<blocks, THREADS_SCAN, (THREADS_SCAN + PAD) * sizeof(uint32_t)>>>(
-                larger_size,
-                data_ptr,
-                end_points,
-                base_out);
+//             uint32_t *data_ptr =
+//                 (iter == 0) ? arr : arr + offsets[iter - 1]; // think this is buggy
+//             scan<<<blocks, THREADS_SCAN, (THREADS_SCAN + PAD) * sizeof(uint32_t)>>>(
+//                 larger_size,
+//                 data_ptr,
+//                 end_points,
+//                 base_out);
 
-            size = larger_size;
-            iter--;
-            end_points = base_out;
+//             size = larger_size;
+//             iter--;
+//             end_points = base_out;
 
-            base_out += larger_size;
+//             base_out += larger_size;
+//         }
+//     }
+//     base_out -= larger_size;
+
+//     return base_out;
+// }
+
+// ============================================================================
+// Pass 0: Vectorized widen (uint8_t -> uint32_t) with uchar4 loads
+// ============================================================================
+__global__ void widen_u8_to_u32_vec4_safe(
+    const uint8_t *__restrict__ in,
+    uint32_t *__restrict__ out,
+    size_t n) {
+    size_t i4 = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
+
+    // Fast path if base pointer is 4B-aligned
+    uintptr_t base = reinterpret_cast<uintptr_t>(in);
+    bool aligned4 = (base & 3u) == 0;
+
+    if (i4 + 3 < n) {
+        if (aligned4) {
+            // Safe to use vector load
+            uchar4 v = *reinterpret_cast<const uchar4 *>(in + i4);
+            out[i4 + 0] = uint32_t(v.x);
+            out[i4 + 1] = uint32_t(v.y);
+            out[i4 + 2] = uint32_t(v.z);
+            out[i4 + 3] = uint32_t(v.w);
+        } else {
+            // Fall back to 4 scalar byte loads (still coalesced)
+            const uint8_t *p = in + i4;
+            out[i4 + 0] = uint32_t(p[0]);
+            out[i4 + 1] = uint32_t(p[1]);
+            out[i4 + 2] = uint32_t(p[2]);
+            out[i4 + 3] = uint32_t(p[3]);
         }
+    } else {
+        // Tail
+        for (int k = 0; k < 4 && i4 + k < n; ++k)
+            out[i4 + k] = uint32_t(in[i4 + k]);
     }
-    base_out -= larger_size;
+}
 
-    return base_out;
+// ============================================================================
+// Pass A: Per-block inclusive scan using shuffles, also writes per-block totals
+// blockDim.x must be a multiple of 32; here we assume 128 (4 warps).
+// ============================================================================
+template <int THREADS>
+__global__ void scan_block_write_totals(
+    size_t n,
+    const uint32_t *__restrict__ x,
+    uint32_t *__restrict__ out,
+    uint32_t *__restrict__ block_sums) {
+    static_assert(THREADS % 32 == 0, "THREADS must be a multiple of 32");
+    static_assert(THREADS <= 1024, "THREADS must be <= 1024");
+
+    const unsigned FULL_MASK = 0xFFFFFFFFu;
+    const int WARP_SIZE = 32;
+
+    const size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    uint32_t v = (idx < n) ? x[idx] : 0u;
+
+    const int lane = threadIdx.x & (WARP_SIZE - 1);
+    const int warp = threadIdx.x >> 5; // warp id within block
+
+// Intra-warp inclusive scan via shuffles
+#pragma unroll
+    for (int d = 1; d < WARP_SIZE; d <<= 1) {
+        uint32_t u = __shfl_up_sync(FULL_MASK, v, d);
+        if (lane >= d)
+            v += u;
+    }
+
+    // Accumulate warp sums in shared
+    __shared__ uint32_t warp_sums[THREADS / WARP_SIZE];
+    if (lane == WARP_SIZE - 1)
+        warp_sums[warp] = v;
+    __syncthreads();
+
+    // Warp 0 scans warp_sums
+    uint32_t warp_off = 0;
+    if (warp == 0) {
+        const int WARPS = THREADS / WARP_SIZE;
+        uint32_t t = (lane < WARPS) ? warp_sums[lane] : 0u;
+#pragma unroll
+        for (int d = 1; d < WARP_SIZE; d <<= 1) {
+            uint32_t u = __shfl_up_sync(FULL_MASK, t, d);
+            if (lane >= d)
+                t += u;
+        }
+        warp_sums[lane] = t;
+    }
+    __syncthreads();
+
+    if (warp > 0)
+        warp_off = warp_sums[warp - 1]; // what to sum
+    v += warp_off;
+
+    if (idx < n)
+        out[idx] = v;
+    // scan per block
+
+    // Last active thread in the block writes the block's total
+    if (threadIdx.x == blockDim.x - 1 || idx == n - 1) {
+        block_sums[blockIdx.x] = v;
+    }
+}
+
+// ============================================================================
+// Pass B (small-array scan): Single-CTA inclusive scan for up to 1024 elems
+// Launch with T threads (multiple of 32, T <= 1024), dynamic smem = (#warps)*4
+// ============================================================================
+__global__ void scan_singleCTA_inclusive(
+    size_t m,
+    const uint32_t *__restrict__ in,
+    uint32_t *__restrict__ out) {
+    extern __shared__ uint32_t smem[]; // holds warp sums (WARPS elements)
+    const unsigned FULL_MASK = 0xFFFFFFFFu;
+    const int WARP_SIZE = 32;
+
+    const int tid = threadIdx.x;
+    const int lane = tid & (WARP_SIZE - 1);
+    const int warp = tid >> 5;
+    const int WARPS = (blockDim.x + 31) / 32;
+
+    uint32_t v = (size_t(tid) < m) ? in[tid] : 0u;
+
+// Intra-warp inclusive
+#pragma unroll
+    for (int d = 1; d < WARP_SIZE; d <<= 1) {
+        uint32_t u = __shfl_up_sync(FULL_MASK, v, d);
+        if (lane >= d)
+            v += u;
+    }
+
+    if (lane == WARP_SIZE - 1)
+        smem[warp] = v;
+    __syncthreads();
+
+    uint32_t warp_off = 0;
+    if (warp == 0) {
+        uint32_t t = (lane < WARPS) ? smem[lane] : 0u;
+#pragma unroll
+        for (int d = 1; d < WARP_SIZE; d <<= 1) {
+            uint32_t u = __shfl_up_sync(FULL_MASK, t, d);
+            if (lane >= d)
+                t += u;
+        }
+        smem[lane] = t;
+    }
+    __syncthreads();
+
+    if (warp > 0)
+        warp_off = smem[warp - 1];
+    v += warp_off;
+
+    if (size_t(tid) < m)
+        out[tid] = v;
+}
+
+// ============================================================================
+// Pass C: Uniform add scanned block-prefix to each element
+// ============================================================================
+__global__ void uniform_add(
+    size_t n,
+    uint32_t *__restrict__ out,
+    const uint32_t *__restrict__ block_prefix) {
+    const size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= n)
+        return;
+    const uint32_t add = (blockIdx.x == 0) ? 0u : block_prefix[blockIdx.x - 1];
+    out[idx] += add;
+}
+
+// ============================================================================
+// Workspace sizing helper for the 3-pass scan
+// Layout: [n] u32_out | [blocksA] block_sums | [blocksA] prefix_L0 |
+//         [blocksB0] tmp0 | [blocksB0] tmp1
+// ============================================================================
+inline size_t get_workspace_size_scan_fast(size_t n, int threads = 128) {
+    const size_t blocksA = CEIL_DIV(n, (size_t)threads);
+    const size_t blocksB0 = CEIL_DIV(blocksA, (size_t)threads);
+    const size_t u32_elems = n + blocksA + blocksA + blocksB0 + blocksB0;
+    return u32_elems * sizeof(uint32_t);
+}
+
+// ============================================================================
+// Main API: 3-pass inclusive scan from uint8_t (d_in) to uint32_t (result)
+// Returns a device pointer (inside `workspace`) to the n-length u32 scan.
+// threads is fixed to 128 in this implementation (4 warps).
+// ============================================================================
+uint32_t *launch_scan(size_t n, const uint8_t *d_in, void *workspace, int threads = 128) {
+    if (n == 0)
+        return nullptr;
+    if (threads != 128) {
+        fprintf(stderr, "launch_scan: this build assumes threads==128.\n");
+        std::exit(2);
+    }
+
+    auto *base = reinterpret_cast<uint32_t *>(workspace);
+    const size_t blocksA = CEIL_DIV(n, (size_t)threads);
+    const size_t blocksB0 = CEIL_DIV(blocksA, (size_t)threads);
+
+    uint32_t *d_out_u32 = base;                     // [0, n)
+    uint32_t *d_block_sums = d_out_u32 + n;         // [n, n+blocksA)
+    uint32_t *d_prefix_L0 = d_block_sums + blocksA; // [.. + blocksA)
+    uint32_t *d_tmp0 = d_prefix_L0 + blocksA;       // [.. + blocksB0)
+    uint32_t *d_tmp1 = d_tmp0 + blocksB0;           // [.. + blocksB0)
+
+    // --- Pass 0: widen u8 -> u32 (vectorized loads) ---
+    {
+        const int t = threads;
+        const int b = int(CEIL_DIV(n, (size_t)(4 * t)));
+        if (b > 0)
+            widen_u8_to_u32_vec4_safe<<<b, t>>>(d_in, d_out_u32, n);
+    }
+
+    // --- Pass A: per-block inclusive scan + block totals ---
+    {
+        const int t = threads;
+        const int b = int(blocksA);
+        if (b > 0)
+            scan_block_write_totals<128><<<b, t>>>(n, d_out_u32, d_out_u32, d_block_sums);
+    }
+
+    // --- Pass B: scan the per-block totals ---
+    if (blocksA <= 1024) {
+        const int T = 1024; // threads for single-CTA scan
+        const int WARPS = (T + 31) / 32;
+        const int smem = WARPS * sizeof(uint32_t);
+        scan_singleCTA_inclusive<<<1, T, smem>>>(blocksA, d_block_sums, d_prefix_L0);
+    } else {
+        // Level 0: scan block_sums in blocks; write prefix_L0; accumulate level-1 sums in
+        // d_tmp0
+        {
+            const int t = threads;
+            const int b = int(blocksB0);
+            scan_block_write_totals<128>
+                <<<b, t>>>(blocksA, d_block_sums, d_prefix_L0, d_tmp0);
+        }
+        // Level 1: scan the level-1 sums with a single CTA into d_tmp1
+        {
+            const int T = 1024;
+            const int WARPS = (T + 31) / 32;
+            const int smem = WARPS * sizeof(uint32_t);
+            scan_singleCTA_inclusive<<<1, T, smem>>>(blocksB0, d_tmp0, d_tmp1);
+        }
+        // Propagate level-1 prefixes back into level-0 prefix
+        uniform_add<<<int(blocksB0), threads>>>(blocksA, d_prefix_L0, d_tmp1);
+    }
+
+    // --- Pass C: uniform add scanned block prefixes into full output ---
+    uniform_add<<<int(blocksA), threads>>>(n, d_out_u32, d_prefix_L0);
+
+    // Optionally synchronize here if the caller expects completion.
+    // CUDA_CHECK(cudaDeviceSynchronize());
+
+    return d_out_u32; // result lives in the first n uint32_t of workspace
 }
 
 #define THREADS_X 32
