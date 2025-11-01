@@ -281,39 +281,37 @@ uint32_t *launch_scan(size_t n, const uint8_t *d_in, void *workspace, int thread
     uint32_t *d_prefix_L0 = d_block_sums + blocksA;
     uint32_t *d_tmp0 = d_prefix_L0 + blocksA;
     uint32_t *d_tmp1 = d_tmp0 + blocksB0;
+    const int t = threads;
+    int b = int(CEIL_DIV(n, (size_t)(4 * t)));
 
-    {
-        const int t = threads;
-        const int b = int(CEIL_DIV(n, (size_t)(4 * t)));
-        if (b > 0)
-            fill_data<<<b, t>>>(d_in, d_out_u32, n); // covert to uint32
-    }
-    {
-        const int t = threads;
-        const int b = int(blocksA);
-        if (b > 0)
-            scan_block_write_totals<<<b, t>>>(n, d_out_u32, d_out_u32, d_block_sums);
-    }
+    // covert to uint32
 
+    if (b > 0)
+        fill_data<<<b, t>>>(d_in, d_out_u32, n);
+
+    b = int(blocksA);
+    if (b > 0)
+        scan_block_write_totals<<<b, t>>>(n, d_out_u32, d_out_u32, d_block_sums);
+
+    const int T = 1024;
     if (blocksA <= 1024) {
-        const int T = 1024; // threads for single-CTA scan
+
         const int WARPS = (T + 31) / 32;
         const int smem = WARPS * sizeof(uint32_t);
         scan_single<<<1, T, smem>>>(blocksA, d_block_sums, d_prefix_L0);
     } else {
         // Level 0
-        {
-            const int t = threads;
-            const int b = int(blocksB0);
-            scan_block_write_totals<<<b, t>>>(blocksA, d_block_sums, d_prefix_L0, d_tmp0);
-        }
+
+        const int t = threads;
+        const int b = int(blocksB0);
+        scan_block_write_totals<<<b, t>>>(blocksA, d_block_sums, d_prefix_L0, d_tmp0);
+
         // Level 1
-        {
-            const int T = 1024;
-            const int WARPS = (T + 31) / 32;
-            const int smem = WARPS * sizeof(uint32_t);
-            scan_single<<<1, T, smem>>>(blocksB0, d_tmp0, d_tmp1);
-        }
+
+        const int WARPS = (T + 31) / 32;
+        const int smem = WARPS * sizeof(uint32_t);
+        scan_single<<<1, T, smem>>>(blocksB0, d_tmp0, d_tmp1);
+
         // Propagate
         uniform_add<<<int(blocksB0), threads>>>(blocksA, d_prefix_L0, d_tmp1);
     }
