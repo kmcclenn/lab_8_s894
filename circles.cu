@@ -406,13 +406,12 @@ __global__ void tile_coverage(
         }
     }
 }
-
+#define MAX_CIRCLES_PER_TILE 44000
 __global__ void compact_stream(
     uint32_t n_circle,
-    uint32_t circle_in_tile,
     uint32_t *scanned_idxs,
-    uint32_t *compacted_idxs,
-    uint32_t **ptr_array
+    uint32_t *compacted_idxs
+    // uint32_t **ptr_array
     // const float *circle_x,
     // float *x_coal,
     // float **x_coal_ptr
@@ -430,15 +429,14 @@ __global__ void compact_stream(
             // x_coal[c_idx - 1] = circle_x[idx];
         }
     }
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        *ptr_array = compacted_idxs;
-    }
+    // if (threadIdx.x == 0 && blockIdx.x == 0) {
+    //     *ptr_array = compacted_idxs;
+    // }
     // *x_coal_ptr = x_coal;
 }
 
 #define CIRCLE_STATS 8
 __global__ void render_pixels(
-    uint32_t **tile_circle_idxs,
     uint32_t *num_circles_per_tile,
     uint32_t num_tiles,
     int32_t width,
@@ -453,7 +451,8 @@ __global__ void render_pixels(
     float const *circle_alpha,
     float *img_red,
     float *img_green,
-    float *img_blue
+    float *img_blue,
+    uint32_t *compacted_stream
 
     // float **x_coal_ptr
 ) {
@@ -481,7 +480,7 @@ __global__ void render_pixels(
     uint32_t n_t_circles = num_circles_per_tile[tile_idx];
 
     // printf("n t  circles: %d\n", n_t_circles);
-    uint32_t *tile_circles = tile_circle_idxs[tile_idx];
+    uint32_t *tile_circles = compacted_stream + tile_idx * MAX_CIRCLES_PER_TILE;
     // float *x_coal = x_coal_ptr[tile_idx];
 
     float red_out[4] = {1.0f, 1.0f, 1.0f, 1.0f};
@@ -589,7 +588,7 @@ __global__ void render_pixels(
         }
     }
 }
-#define MAX_CIRCLES_PER_TILE 45000
+
 void launch_render(
     int32_t width,
     int32_t height,
@@ -643,7 +642,10 @@ void launch_render(
         memory_pool.alloc(num_tiles * sizeof(uint32_t))); //[num_tiles];
     void *scan_workspace = memory_pool.alloc(scan_size);
 
-    size_t mtemp = 0;
+    // size_t mtemp = 0;
+
+    uint32_t *compacted_stream = reinterpret_cast<uint32_t *>(
+        memory_pool.alloc(num_tiles * MAX_CIRCLES_PER_TILE * sizeof(uint32_t)));
 
     for (int i = 0; i < num_tiles; ++i) {
 
@@ -653,19 +655,6 @@ void launch_render(
             (size_t)n_circle,
             circle_map + (size_t)i * (size_t)n_circle,
             scan_workspace);
-        // /REAL
-
-        // DEBUG PLACEHOLDER
-        // uint32_t *scanned_circle_idxs = reinterpret_cast<uint32_t *>(scan_workspace);
-        // /DEBUG PLACEHOLDER
-
-        size_t temp = 0;
-        // printf("defined temp %d\n", i);
-        CUDA_CHECK(cudaMemcpy(
-            &temp,                                // (num_circles_per_tile[i])
-            scanned_circle_idxs + (n_circle - 1), // tried with 0
-            sizeof(uint32_t),
-            cudaMemcpyDeviceToHost));
 
         CUDA_CHECK(cudaMemcpy(
             num_circles_per_tile + i,
@@ -673,37 +662,14 @@ void launch_render(
             sizeof(uint32_t),
             cudaMemcpyDeviceToDevice // this must match your pointers
             ));
-        // printf("copied 2 %d\n", i);
-        // printf("%d\n", temp);
-        if (temp == 0) {
-            CUDA_CHECK(cudaMemcpy(
-                tile_circle_idxs + i,
-                &temp,
-                sizeof(uint32_t),
-                cudaMemcpyHostToDevice // this must match your pointers
-                ));
-            continue;
-        }
-        // printf("temp on loop %ld: %zu\n", i, temp);
-
-        uint32_t *compacted_stream =
-            reinterpret_cast<uint32_t *>(memory_pool.alloc(temp * sizeof(uint32_t)));
-
-        if (temp > mtemp) {
-            mtemp = temp;
-        }
-        // float *x_coal =
-        // reinterpret_cast<float *>(memory_pool.alloc(temp * sizeof(float)));
 
         compact_stream<<<blocks_c, threads_c>>>(
             n_circle,
-            temp,
             scanned_circle_idxs,
-            compacted_stream,
-            (tile_circle_idxs + i));
+            compacted_stream + i * MAX_CIRCLES_PER_TILE);
     }
 
-    printf("MAX TEMP: %zu\n", mtemp);
+    // printf("MAX TEMP: %zu\n", mtemp);
 
     int tileToBlock = (TILE_SIZE / THREADS_X);
     dim3 threads_p = dim3(THREADS_X, THREADS_Y);
@@ -716,7 +682,6 @@ void launch_render(
     //     render_shmem));
 
     render_pixels<<<blocks_p, threads_p, render_shmem>>>(
-        tile_circle_idxs,
         num_circles_per_tile,
         num_tiles,
         width,
@@ -731,7 +696,8 @@ void launch_render(
         circle_alpha,
         img_red,
         img_green,
-        img_blue
+        img_blue,
+        compacted_stream
 
         // x_coal_ptr
 
